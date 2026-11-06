@@ -3001,7 +3001,7 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     /// `feature_extractor` in processor_config.json (E2B / E4B audio).
     public let audioFeatures: Gemma4AudioFeatureExtractor?
 
-    private struct FeatureExtractorConfiguration: Codable {
+    private struct FeatureExtractorConfiguration: Codable, Sendable {
         let samplingRate: Int?
         let featureSize: Int?
         let frameLengthMs: Double?
@@ -3033,6 +3033,9 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
             case featureExtractorType = "feature_extractor_type"
         }
     }
+
+    /// The `feature_extractor` block as read, kept so `encode(to:)` writes it back.
+    private let featureExtractorConfiguration: FeatureExtractorConfiguration?
 
     private enum AudioKeys: String, CodingKey {
         case audioTokenId = "audio_token_id"
@@ -3120,7 +3123,9 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         audioTokenId = try a.decodeIfPresent(Int.self, forKey: .audioTokenId) ?? 258_881
         boaTokenId = try a.decodeIfPresent(Int.self, forKey: .boaTokenId) ?? 256_000
         eoaTokenId = try a.decodeIfPresent(Int.self, forKey: .eoaTokenId) ?? 258_883
-        if let fe = try a.decodeIfPresent(FeatureExtractorConfiguration.self, forKey: .featureExtractor),
+        let fe = try a.decodeIfPresent(FeatureExtractorConfiguration.self, forKey: .featureExtractor)
+        featureExtractorConfiguration = fe
+        if let fe,
             fe.featureExtractorType == nil || fe.featureExtractorType == "Gemma4AudioFeatureExtractor"
         {
             audioFeatures = Gemma4AudioFeatureExtractor(
@@ -3150,6 +3155,11 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         try c.encode(imageTokenId, forKey: CodingKeys.imageTokenId)
         try c.encode(boiTokenId, forKey: CodingKeys.boiTokenId)
         try c.encodeIfPresent(eoiTokenId, forKey: CodingKeys.eoiTokenId)
+        var a = encoder.container(keyedBy: AudioKeys.self)
+        try a.encode(audioTokenId, forKey: .audioTokenId)
+        try a.encode(boaTokenId, forKey: .boaTokenId)
+        try a.encode(eoaTokenId, forKey: .eoaTokenId)
+        try a.encodeIfPresent(featureExtractorConfiguration, forKey: .featureExtractor)
     }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {

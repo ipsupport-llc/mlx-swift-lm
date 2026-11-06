@@ -49,6 +49,10 @@ public struct LFM2Configuration: Codable, Sendable {
     let ropeTheta: Float
     var headDimensions: Int { hiddenSize / attentionHeads }
 
+    private enum ExtraKeys: String, CodingKey {
+        case intermediateSize = "intermediate_size"
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case vocabularySize = "vocab_size"
@@ -87,7 +91,12 @@ public struct LFM2Configuration: Codable, Sendable {
         self.convBias = try container.decodeIfPresent(Bool.self, forKey: .convBias) ?? false
         self.convLCache = try container.decodeIfPresent(Int.self, forKey: .convLCache) ?? 3
         self._blockDim = try container.decodeIfPresent(Int.self, forKey: ._blockDim)
-        self._blockFFDim = try container.decodeIfPresent(Int.self, forKey: ._blockFFDim)
+        // transformers 5.x configs (LFM2.5) name the MLP width `intermediate_size`
+        // and carry no `block_ff_dim`; without this the MLP is built at hidden size.
+        self._blockFFDim =
+            try container.decodeIfPresent(Int.self, forKey: ._blockFFDim)
+            ?? decoder.container(keyedBy: ExtraKeys.self)
+                .decodeIfPresent(Int.self, forKey: .intermediateSize)
         self.blockMultipleOf =
             try container.decodeIfPresent(Int.self, forKey: .blockMultipleOf) ?? 256
         self.blockFFNDimMultiplier =

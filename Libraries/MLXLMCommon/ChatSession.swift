@@ -1175,16 +1175,17 @@ public final class ChatSession {
                                     })
                                     .max(by: { $0.tokens.count < $1.tokens.count })
                             {
-                                let restored = KVCacheStorage(
-                                    checkpoint.cache.map { $0.copy() }, plan: kvCachePlan)
-                                if restored.processedTokenCount == checkpoint.tokens.count {
-                                    kvCache = restored
-                                    draftKVCache = nil
-                                    lmState = checkpoint.state
-                                    decision = .appendSuffix(
-                                        suffixStart: checkpoint.tokens.count,
-                                        representedTokens: promptTokenIds)
-                                }
+                                // The copy's own entries can't always say where the
+                                // timeline was (shared and sliding layers): it's the
+                                // checkpoint's token count.
+                                kvCache = KVCacheStorage(
+                                    checkpoint.cache.map { $0.copy() }, plan: kvCachePlan,
+                                    processedTokenCount: checkpoint.tokens.count)
+                                draftKVCache = nil
+                                lmState = checkpoint.state
+                                decision = .appendSuffix(
+                                    suffixStart: checkpoint.tokens.count,
+                                    representedTokens: promptTokenIds)
                             }
 
                             // Splitting a prepared input is the other decision that

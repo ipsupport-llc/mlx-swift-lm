@@ -185,6 +185,7 @@ public final class ChatSession {
                 // the ledger and rebuild from the retained messages.
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoints.removeAll()
                 return false
             }
 
@@ -203,6 +204,7 @@ public final class ChatSession {
                 // un-emitted lookahead).
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoints.removeAll()
             }
 
             messages.append(
@@ -258,6 +260,19 @@ public final class ChatSession {
         let tokens: [Int]
         let cache: [KVCache]
         let state: LMOutput.State?
+
+        /// Cache types whose `copy()` keeps everything a restore needs.
+        /// Others (TurboQuant has none and traps; ChunkedKVCache drops its
+        /// trimmed front's offset; lists hide their entries) get no
+        /// checkpoint. Exact types: a subclass may add state.
+        static func canCopy(_ cache: [KVCache]) -> Bool {
+            cache.allSatisfy { entry in
+                let t = type(of: entry)
+                return t == KVCacheSimple.self || t == RotatingKVCache.self
+                    || t == QuantizedKVCache.self || t == ArraysCache.self
+                    || t == MambaCache.self
+            }
+        }
     }
 
     /// All mutable continuation state for one realized model cache.
@@ -1186,9 +1201,12 @@ public final class ChatSession {
                                 // The copy's own entries can't always say where the
                                 // timeline was (shared and sliding layers): it's the
                                 // checkpoint's token count.
+                                // The copy is used as is (no third copy held): this
+                                // turn's prefill takes the next checkpoint.
                                 kvCache = KVCacheStorage(
-                                    checkpoint.cache.map { $0.copy() }, plan: kvCachePlan,
+                                    checkpoint.cache, plan: kvCachePlan,
                                     processedTokenCount: checkpoint.tokens.count)
+                                currentConversation.checkpoints.removeAll()
                                 draftKVCache = nil
                                 lmState = checkpoint.state
                                 decision = .appendSuffix(
@@ -1294,7 +1312,9 @@ public final class ChatSession {
                             if current.checkpoints.count > 1 { current.checkpoints.removeLast() }
                             checkpointsTaken += 1
                             let count = kvCache.processedTokenCount
-                            if !media, count > 0, count <= current.cachedTokens.count {
+                            if !media, count > 0, count <= current.cachedTokens.count,
+                                PromptCheckpoint.canCopy(kvCache.cache)
+                            {
                                 current.checkpoints.append(
                                     PromptCheckpoint(
                                         tokens: Array(current.cachedTokens.prefix(count)),

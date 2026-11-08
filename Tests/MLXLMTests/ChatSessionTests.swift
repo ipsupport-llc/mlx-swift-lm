@@ -33,6 +33,9 @@ public class ChatSessionTests: XCTestCase {
         let renderedLengthContinuation: AsyncStream<Int>.Continuation
         var rewritesPrefixOnContinuation = false
         var rewritesCachedTailOnContinuation = false
+        /// Renders an earlier answer with other tokens than it was generated
+        /// with (a real tokenizer re-encoding the decoded text).
+        var rerendersAnswers = false
 
         var bosToken: String? = nil
         var eosToken: String? = nil
@@ -81,7 +84,11 @@ public class ChatSessionTests: XCTestCase {
                 default:
                     tokens.append(99)
                 }
-                tokens.append(contentsOf: encode(text: content, addSpecialTokens: false))
+                var encoded = encode(text: content, addSpecialTokens: false)
+                if rerendersAnswers, role == "assistant", !encoded.isEmpty {
+                    encoded[0] = 91
+                }
+                tokens.append(contentsOf: encoded)
                 if role != "assistant" {
                     tokens.append(95)
                 }
@@ -121,6 +128,8 @@ public class ChatSessionTests: XCTestCase {
         let tokenizer: Tokenizer
         let configuration = ModelConfiguration(id: "test")
         let messageGenerator = DefaultMessageGenerator()
+        /// Masks out the first token, as left padding would.
+        var pads = false
 
         func prepare(input: UserInput) throws -> LMInput {
             let messages = messageGenerator.generate(from: input)
@@ -128,8 +137,9 @@ public class ChatSessionTests: XCTestCase {
                 messages: messages,
                 tools: input.tools,
                 additionalContext: input.additionalContext)
-            let mask = MLXArray(Array(repeating: 1, count: tokens.count))
-                .reshaped(1, tokens.count)
+            var ones = Array(repeating: 1, count: tokens.count)
+            if pads, !ones.isEmpty { ones[0] = 0 }
+            let mask = MLXArray(ones).reshaped(1, tokens.count)
             return LMInput(text: .init(tokens: MLXArray(tokens), mask: mask))
         }
     }
@@ -779,11 +789,34 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertGreaterThan(second.info.cacheEfficiency, 0)
     }
 
-    func testExactPrefixReuseRebuildsWhenPreparedInputHasMask() async throws {
+    /// A processor that attaches an all-ones mask to plain text (Gemma 4's
+    /// does) masks nothing: the cached prefix is still extended.
+    func testExactPrefixReuseKeepsCacheWhenTextMaskIsAllOnes() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()
         let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
         let processor = MaskedInputProcessor(tokenizer: tokenizer)
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: "first")
+        let firstRenderedLengthValue = await lengthIterator.next()
+        let firstRenderedLength = try XCTUnwrap(firstRenderedLengthValue)
+
+        let second = try await collectGeneration(session.streamDetails(to: "second"))
+        let secondRenderedLengthValue = await lengthIterator.next()
+        let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
+
+        XCTAssertEqual(second.info.promptTokenCount, secondRenderedLength - firstRenderedLength - 3)
+    }
+
+    /// A mask that really masks (padding) still rebuilds.
+    func testExactPrefixReuseRebuildsWhenPreparedInputHasPaddingMask() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = MaskedInputProcessor(tokenizer: tokenizer, pads: true)
         let session = ChatSession(
             model(processor: processor),
             generateParameters: GenerateParameters(maxTokens: 3))
@@ -795,6 +828,65 @@ public class ChatSessionTests: XCTestCase {
         let secondRenderedLengthValue = await lengthIterator.next()
         let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
 
+        XCTAssertEqual(second.info.promptTokenCount, secondRenderedLength)
+    }
+
+    /// The answer renders with other tokens than were generated, and the
+    /// sliding-window cache has wrapped (it can't be rewound): the turn starts
+    /// from the checkpoint taken after the first prompt's prefill.
+    func testContinuationStartsFromPromptCheckpointWhenCacheCannotRewind() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(
+            renderedLengthContinuation: continuation, rerendersAnswers: true)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3, maxKVSize: 4))
+
+        _ = try await session.respond(to: "first message")
+        let firstRenderedLengthValue = await lengthIterator.next()
+        let firstRenderedLength = try XCTUnwrap(firstRenderedLengthValue)
+
+        let second = try await collectGeneration(session.streamDetails(to: "second"))
+        let secondRenderedLengthValue = await lengthIterator.next()
+        let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
+
+        XCTAssertEqual(second.info.cachedPromptTokenCount, firstRenderedLength)
+        XCTAssertEqual(second.info.promptTokenCount, secondRenderedLength - firstRenderedLength)
+
+        // A third turn continues from the second's checkpoint the same way.
+        let third = try await collectGeneration(session.streamDetails(to: "third"))
+        let thirdRenderedLengthValue = await lengthIterator.next()
+        let thirdRenderedLength = try XCTUnwrap(thirdRenderedLengthValue)
+        XCTAssertEqual(third.info.cachedPromptTokenCount, secondRenderedLength)
+        XCTAssertEqual(third.info.promptTokenCount, thirdRenderedLength - secondRenderedLength)
+    }
+
+    /// A prompt that doesn't begin with the checkpoint still rebuilds.
+    func testCheckpointIsNotUsedWhenThePromptDivergesBeforeIt() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(
+            renderedLengthContinuation: continuation, rewritesPrefixOnContinuation: true)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3, maxKVSize: 4))
+
+        _ = try await session.respond(to: "first message")
+        _ = await lengthIterator.next()
+
+        let second = try await collectGeneration(session.streamDetails(to: "second"))
+        let secondRenderedLengthValue = await lengthIterator.next()
+        let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
+        XCTAssertEqual(second.info.cachedPromptTokenCount, 0)
         XCTAssertEqual(second.info.promptTokenCount, secondRenderedLength)
     }
 

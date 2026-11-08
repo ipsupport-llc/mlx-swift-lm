@@ -162,6 +162,16 @@ public final class ChatSession {
         /// leave its final verifier sample here.
         var uncommittedTokens: [Int] = []
 
+        /// The cache as it was right after the last prompt's prefill, before
+        /// any generated token. The next turn's render of the answer seldom
+        /// reproduces the generated tokens exactly, and a sliding-window cache
+        /// can't be rewound to the common prefix; this copy can: the next
+        /// turn starts from it and prefills only the answer and the new
+        /// message instead of the whole conversation.
+        /// The user turn's prefill and, after tool rounds, the latest one
+        /// (the next render may not reproduce the tool call's tokens).
+        var checkpoints: [PromptCheckpoint] = []
+
         @discardableResult
         mutating func record(
             _ assistant: AssistantGeneration,
@@ -175,6 +185,7 @@ public final class ChatSession {
                 // the ledger and rebuild from the retained messages.
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoints.removeAll()
                 return false
             }
 
@@ -193,6 +204,7 @@ public final class ChatSession {
                 // un-emitted lookahead).
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoints.removeAll()
             }
 
             messages.append(
@@ -238,6 +250,27 @@ public final class ChatSession {
             }
             if let info = item.info {
                 stopReason = info.stopReason
+            }
+        }
+    }
+
+    /// A copy of the main cache at the end of a prefilled prompt.
+    private struct PromptCheckpoint {
+        /// The tokens the copy represents (a prefix of that prompt).
+        let tokens: [Int]
+        let cache: [KVCache]
+        let state: LMOutput.State?
+
+        /// Cache types whose `copy()` keeps everything a restore needs.
+        /// Others (TurboQuant has none and traps; ChunkedKVCache drops its
+        /// trimmed front's offset; lists hide their entries) get no
+        /// checkpoint. Exact types: a subclass may add state.
+        static func canCopy(_ cache: [KVCache]) -> Bool {
+            cache.allSatisfy { entry in
+                let t = type(of: entry)
+                return t == KVCacheSimple.self || t == RotatingKVCache.self
+                    || t == QuantizedKVCache.self || t == ArraysCache.self
+                    || t == MambaCache.self
             }
         }
     }
@@ -977,6 +1010,7 @@ public final class ChatSession {
                             // rather than silently continuing with the old cache policy.
                             restored.cachedTokens.removeAll()
                             restored.uncommittedTokens.removeAll()
+                            restored.checkpoints.removeAll()
                             kvCache = KVCacheStorage(
                                 try model.newCache(parameters: generateParameters),
                                 plan: kvCachePlan)
@@ -1013,6 +1047,7 @@ public final class ChatSession {
                             .promptCacheReuseRules(tokenizer: tokenizer) ?? [])
 
                     // loop can restart on tool calls
+                    var checkpointsTaken = 0
                     restart: while !pendingMessages.isEmpty {
                         let isToolResultContinuation =
                             pendingMessages.contains { $0.role == .tool }
@@ -1073,6 +1108,14 @@ public final class ChatSession {
                         let carriesPreparedMedia =
                             preparedInput.image != nil || preparedInput.video != nil
                             || preparedInput.audio != nil
+                        // A processor may attach an all-ones mask to a plain text
+                        // prompt (Gemma 4's does): that masks nothing, and taking it
+                        // for padding made every turn rebuild the whole cache. With
+                        // media, a mask's meaning is the model's: kept as a mask.
+                        let carriesPaddingMask =
+                            input.text.mask.map {
+                                carriesPreparedMedia || !$0.all().item(Bool.self)
+                            } ?? false
                         if var currentConversation = conversation {
                             let promptTokenIds = input.text.tokens.asArray(Int.self)
                             let cachedTokenIds = currentConversation.cachedTokens
@@ -1100,7 +1143,7 @@ public final class ChatSession {
                                 promptTokens: promptTokenIds,
                                 carriesNewMedia: containsNewMedia,
                                 carriesPreparedMedia: carriesPreparedMedia,
-                                carriesAttentionMask: input.text.mask != nil,
+                                carriesAttentionMask: carriesPaddingMask,
                                 carriesModelState: lmState != nil,
                                 isToolResultContinuation: isToolResultContinuation,
                                 previousGenerationUncommittedTokens:
@@ -1139,6 +1182,36 @@ public final class ChatSession {
                                 if !(mainTrimIsAligned && draftTrimIsAligned) {
                                     decision = .rebuild
                                 }
+                            }
+
+                            // No prefix of the cache can be kept: start from the
+                            // checkpoint taken after the last prompt's prefill
+                            // when this prompt still begins with it.
+                            if case .rebuild = decision,
+                                speculativeDecoding == nil,
+                                !containsNewMedia, !carriesPreparedMedia,
+                                !carriesPaddingMask,
+                                let checkpoint = currentConversation.checkpoints
+                                    .filter({
+                                        $0.tokens.count < promptTokenIds.count
+                                            && promptTokenIds.starts(with: $0.tokens)
+                                    })
+                                    .max(by: { $0.tokens.count < $1.tokens.count })
+                            {
+                                // The copy's own entries can't always say where the
+                                // timeline was (shared and sliding layers): it's the
+                                // checkpoint's token count.
+                                // The copy is used as is (no third copy held): this
+                                // turn's prefill takes the next checkpoint.
+                                kvCache = KVCacheStorage(
+                                    checkpoint.cache, plan: kvCachePlan,
+                                    processedTokenCount: checkpoint.tokens.count)
+                                currentConversation.checkpoints.removeAll()
+                                draftKVCache = nil
+                                lmState = checkpoint.state
+                                decision = .appendSuffix(
+                                    suffixStart: checkpoint.tokens.count,
+                                    representedTokens: promptTokenIds)
                             }
 
                             // Splitting a prepared input is the other decision that
@@ -1228,6 +1301,29 @@ public final class ChatSession {
                             throw ChatSessionError.emptyPreparedInput
                         }
 
+                        /// Copies the main cache right after a prefill (see
+                        /// `Conversation.checkpoint`). Media prompts aren't kept:
+                        /// their tokens don't carry the pixels.
+                        func takeCheckpoint(media: Bool) {
+                            guard var current = conversation else { return }
+                            // A new user turn starts the list; a tool round adds
+                            // its latest prefill after the turn's own.
+                            if checkpointsTaken == 0 { current.checkpoints.removeAll() }
+                            if current.checkpoints.count > 1 { current.checkpoints.removeLast() }
+                            checkpointsTaken += 1
+                            let count = kvCache.processedTokenCount
+                            if !media, count > 0, count <= current.cachedTokens.count,
+                                PromptCheckpoint.canCopy(kvCache.cache)
+                            {
+                                current.checkpoints.append(
+                                    PromptCheckpoint(
+                                        tokens: Array(current.cachedTokens.prefix(count)),
+                                        cache: kvCache.cache.map { $0.copy() },
+                                        state: lmState))
+                            }
+                            conversation = current
+                        }
+
                         // Select the token iterator based on speculative decoding configuration.
                         let generation: GenerationRun
                         func defaultGeneration() throws -> GenerationRun {
@@ -1238,6 +1334,7 @@ public final class ChatSession {
                                 state: lmState,
                                 parameters: generateParameters, components: components)
                             lmState = iterator.state
+                            takeCheckpoint(media: carriesPreparedMedia)
 
                             return GenerationRun(
                                 MLXLMCommon.generateTaskRecordingTokens(
@@ -1620,3 +1717,4 @@ public enum ChatSessionError: LocalizedError {
         }
     }
 }
+

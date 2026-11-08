@@ -1094,6 +1094,11 @@ public final class ChatSession {
                         let carriesPreparedMedia =
                             preparedInput.image != nil || preparedInput.video != nil
                             || preparedInput.audio != nil
+                        // A processor may attach an all-ones mask to a plain text
+                        // prompt (Gemma 4's does): that masks nothing, and taking it
+                        // for padding made every turn rebuild the whole cache.
+                        let carriesPaddingMask =
+                            input.text.mask.map { !$0.all().item(Bool.self) } ?? false
                         if var currentConversation = conversation {
                             let promptTokenIds = input.text.tokens.asArray(Int.self)
                             let cachedTokenIds = currentConversation.cachedTokens
@@ -1121,7 +1126,7 @@ public final class ChatSession {
                                 promptTokens: promptTokenIds,
                                 carriesNewMedia: containsNewMedia,
                                 carriesPreparedMedia: carriesPreparedMedia,
-                                carriesAttentionMask: input.text.mask != nil,
+                                carriesAttentionMask: carriesPaddingMask,
                                 carriesModelState: lmState != nil,
                                 isToolResultContinuation: isToolResultContinuation,
                                 previousGenerationUncommittedTokens:
@@ -1169,7 +1174,7 @@ public final class ChatSession {
                             if case .rebuild = decision,
                                 speculativeDecoding == nil,
                                 !containsNewMedia, !carriesPreparedMedia,
-                                input.text.mask == nil,
+                                !carriesPaddingMask,
                                 let checkpoint = currentConversation.checkpoints
                                     .filter({
                                         $0.tokens.count < promptTokenIds.count

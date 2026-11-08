@@ -149,6 +149,7 @@ public struct SpeculativeDecodingConfig: Sendable {
 ///   until ``clear()`` is called. Long-running VLM sessions should clear or replace
 ///   the session when that retained context is no longer needed.
 public final class ChatSession {
+    nonisolated(unsafe) public static var debugLog: ((String) -> Void)?
 
     private struct Conversation {
         var messages: [Chat.Message]
@@ -1161,7 +1162,7 @@ public final class ChatSession {
                                 }
                             }
 
-                            NSLog("CPDEBUG decision=%@ prompt=%d cached=%d processed=%d checkpoints=%@ match=%@", "\(decision)", promptTokenIds.count, cachedTokenIds.count, kvCache.processedTokenCount, "\(currentConversation.checkpoints.map(\.tokens.count))", "\(currentConversation.checkpoints.map { cp in zip(promptTokenIds, cp.tokens).prefix { $0 == $1 }.count })")
+                            ChatSession.debugLog?("CPDEBUG decision=\(decision) prompt=\(promptTokenIds.count) cached=\(cachedTokenIds.count) processed=\(kvCache.processedTokenCount) checkpoints=\(currentConversation.checkpoints.map(\.tokens.count)) match=\(currentConversation.checkpoints.map { cp in zip(promptTokenIds, cp.tokens).prefix { $0 == $1 }.count }) firstdiff=\(zip(promptTokenIds, cachedTokenIds).prefix { $0 == $1 }.count)")
                             // No prefix of the cache can be kept: start from the
                             // checkpoint taken after the last prompt's prefill
                             // when this prompt still begins with it.
@@ -1287,7 +1288,7 @@ public final class ChatSession {
                             if current.checkpoints.count > 1 { current.checkpoints.removeLast() }
                             checkpointsTaken += 1
                             let count = kvCache.processedTokenCount
-                            NSLog("CPDEBUG take media=%d count=%d cachedTokens=%d", media ? 1 : 0, count, current.cachedTokens.count)
+                            ChatSession.debugLog?("CPDEBUG take media=\(media) count=\(count) cachedTokens=\(current.cachedTokens.count)")
                             if !media, count > 0, count <= current.cachedTokens.count {
                                 current.checkpoints.append(
                                     PromptCheckpoint(

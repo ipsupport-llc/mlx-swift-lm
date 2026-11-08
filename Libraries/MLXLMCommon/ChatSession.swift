@@ -149,7 +149,6 @@ public struct SpeculativeDecodingConfig: Sendable {
 ///   until ``clear()`` is called. Long-running VLM sessions should clear or replace
 ///   the session when that retained context is no longer needed.
 public final class ChatSession {
-    nonisolated(unsafe) public static var debugLog: ((String) -> Void)?
 
     private struct Conversation {
         var messages: [Chat.Message]
@@ -1096,9 +1095,12 @@ public final class ChatSession {
                             || preparedInput.audio != nil
                         // A processor may attach an all-ones mask to a plain text
                         // prompt (Gemma 4's does): that masks nothing, and taking it
-                        // for padding made every turn rebuild the whole cache.
+                        // for padding made every turn rebuild the whole cache. With
+                        // media, a mask's meaning is the model's: kept as a mask.
                         let carriesPaddingMask =
-                            input.text.mask.map { !$0.all().item(Bool.self) } ?? false
+                            input.text.mask.map {
+                                carriesPreparedMedia || !$0.all().item(Bool.self)
+                            } ?? false
                         if var currentConversation = conversation {
                             let promptTokenIds = input.text.tokens.asArray(Int.self)
                             let cachedTokenIds = currentConversation.cachedTokens
@@ -1167,7 +1169,6 @@ public final class ChatSession {
                                 }
                             }
 
-                            ChatSession.debugLog?("CPDEBUG decision=\(decision) prompt=\(promptTokenIds.count) cached=\(cachedTokenIds.count) processed=\(kvCache.processedTokenCount) checkpoints=\(currentConversation.checkpoints.map(\.tokens.count)) match=\(currentConversation.checkpoints.map { cp in zip(promptTokenIds, cp.tokens).prefix { $0 == $1 }.count }) firstdiff=\(zip(promptTokenIds, cachedTokenIds).prefix { $0 == $1 }.count)")
                             // No prefix of the cache can be kept: start from the
                             // checkpoint taken after the last prompt's prefill
                             // when this prompt still begins with it.
@@ -1293,7 +1294,6 @@ public final class ChatSession {
                             if current.checkpoints.count > 1 { current.checkpoints.removeLast() }
                             checkpointsTaken += 1
                             let count = kvCache.processedTokenCount
-                            ChatSession.debugLog?("CPDEBUG take media=\(media) count=\(count) cachedTokens=\(current.cachedTokens.count)")
                             if !media, count > 0, count <= current.cachedTokens.count {
                                 current.checkpoints.append(
                                     PromptCheckpoint(
@@ -1697,3 +1697,4 @@ public enum ChatSessionError: LocalizedError {
         }
     }
 }
+

@@ -1161,6 +1161,7 @@ public final class ChatSession {
                                 }
                             }
 
+                            NSLog("CPDEBUG decision=%@ prompt=%d cached=%d processed=%d checkpoints=%@ match=%@", "\(decision)", promptTokenIds.count, cachedTokenIds.count, kvCache.processedTokenCount, "\(currentConversation.checkpoints.map(\.tokens.count))", "\(currentConversation.checkpoints.map { cp in zip(promptTokenIds, cp.tokens).prefix { $0 == $1 }.count })")
                             // No prefix of the cache can be kept: start from the
                             // checkpoint taken after the last prompt's prefill
                             // when this prompt still begins with it.
@@ -1286,6 +1287,7 @@ public final class ChatSession {
                             if current.checkpoints.count > 1 { current.checkpoints.removeLast() }
                             checkpointsTaken += 1
                             let count = kvCache.processedTokenCount
+                            NSLog("CPDEBUG take media=%d count=%d cachedTokens=%d", media ? 1 : 0, count, current.cachedTokens.count)
                             if !media, count > 0, count <= current.cachedTokens.count {
                                 current.checkpoints.append(
                                     PromptCheckpoint(

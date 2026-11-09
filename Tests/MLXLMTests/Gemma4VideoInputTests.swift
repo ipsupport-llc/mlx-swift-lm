@@ -101,7 +101,8 @@ struct Gemma4VideoInputTests {
             return
         }
         eval(out.logits)
-        #expect(out.logits.shape == [1, tokens.count, 200])
+        // A media prompt keeps only its last position's logits.
+        #expect(out.logits.shape == [1, 1, 200])
     }
 
     /// `Gemma4Processor.processVideos` samples/preprocesses frames into a

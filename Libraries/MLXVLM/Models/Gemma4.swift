@@ -1425,14 +1425,21 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         perLayerInputs: MLXArray? = nil,
         tokenTypeIds: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        emitDrafterState: Bool = false
+        emitDrafterState: Bool = false,
+        lastLogitsOnly: Bool = false
     ) -> LMOutput {
-        let (hidden, sharedKV, sharedKVSources) = model(
+        var (hidden, sharedKV, sharedKVSources) = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs,
             tokenTypeIds: tokenTypeIds,
             emitDrafterState: emitDrafterState
         )
+        // A prompt prefilled in one pass needs only its last position's
+        // logits: over the whole vocabulary (262k) every position costs
+        // ~1 MB, so a 1,600-token prompt with a photo took 1.6 GB more.
+        if lastLogitsOnly, !emitDrafterState, hidden.dim(1) > 1 {
+            hidden = hidden[0..., (hidden.dim(1) - 1)...]
+        }
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(hidden)
@@ -2176,7 +2183,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                     inputIds: input.text.tokens,
                     imageTokenId: config.imageTokenId,
                     videoTokenId: config.videoTokenId,
-                    audioTokenId: config.audioTokenId)
+                    audioTokenId: config.audioTokenId),
+                lastLogitsOnly: true
             )
             let total = inputsEmbeds.dim(1)
             prefill.progress?(total, total)
